@@ -69,6 +69,7 @@ import (
 var (
 	hostAPI        atomic.Pointer[C.cliproxy_host_api]
 	pluginStateMu  sync.Mutex
+	lifecycleMu    sync.Mutex
 	globalState    = &PluginState{Accounts: map[string]AccountRuntime{}}
 	globalWorker   *Worker
 	globalHandlers *managementHandlers
@@ -77,7 +78,7 @@ var (
 	// dir). All saves go through it so reconfigure cannot split state
 	// across locations.
 	globalStatePath string
-	pluginVersion   = "0.1.14"
+	pluginVersion   = "0.2.0"
 )
 
 func main() {}
@@ -127,11 +128,11 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
-	pluginStateMu.Lock()
-	w := globalWorker
-	pluginStateMu.Unlock()
-	if w != nil {
-		w.Stop()
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	stopCurrentWorker()
+	if globalStatePath != "" {
+		_ = SaveStateNow(globalStatePath)
 	}
 }
 
@@ -263,6 +264,9 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 }
 
 func configurePlugin(raw []byte) error {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	stopCurrentWorker()
 	var req lifecycleRequest
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &req); err != nil {
@@ -311,6 +315,9 @@ func configurePlugin(raw []byte) error {
 	if yamlStateDir != "" {
 		cfg.StateDir = yamlStateDir
 	}
+	if source != "main" && source != "fresh" {
+		cfg.ObserveOnly = true
+	}
 	globalState = loaded
 	globalState.Config = cfg
 
@@ -321,6 +328,7 @@ func configurePlugin(raw []byte) error {
 	enabled := cfg.EnabledAccounts
 	globalWorker = NewWorker(cfg, enabled, hostCredsLoader, time.Now)
 	globalWorker.AccountEnumerator = listCodexAuthIndexes
+	wireDurability(globalWorker)
 	// Always announce the state location and load source — on FIRST load too,
 	// not just reconfigure — so operators know what to back up / volume-mount.
 	loadLevel := "info"
@@ -374,6 +382,9 @@ func configurePlugin(raw []byte) error {
 // PUT /settings so config changes (enabled_accounts, refresh_interval) take
 // effect immediately instead of requiring a plugin reload.
 func restartWorkerFromState() {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	stopCurrentWorker()
 	pluginStateMu.Lock()
 	defer pluginStateMu.Unlock()
 	if globalWorker != nil {
@@ -382,6 +393,7 @@ func restartWorkerFromState() {
 	cfg := globalState.Config
 	w := NewWorker(cfg, cfg.EnabledAccounts, hostCredsLoader, time.Now)
 	w.AccountEnumerator = listCodexAuthIndexes
+	wireDurability(w)
 	// Carry over existing logs so a settings-change restart doesn't lose them.
 	if globalWorker != nil {
 		w.Logs().load(globalWorker.Logs().all())
@@ -408,27 +420,19 @@ func restartWorkerFromState() {
 // Returns the record to the caller so host-side post-reset work can run
 // outside pluginStateMu.
 func syncFSMIntoGlobalState(logs *logRing, authID string, fsm *AccountFSM) *ResetRecord {
+	r := fsm.Runtime()
+	rec := fsm.TakePendingHistory()
+	entries := logs.all()
 	pluginStateMu.Lock()
 	defer pluginStateMu.Unlock()
-	globalState.Accounts[authID] = AccountRuntime{
-		AuthID:       authID,
-		State:        fsm.State(),
-		NextWake:     fsm.NextWake(),
-		LastSnapshot: fsm.LastSnapshot(),
-	}
-	// Collect pending reset history from the FSM (set in stepVERIFYING,
-	// not cleared by Reset).
-	var rec *ResetRecord
-	if r := fsm.TakePendingHistory(); r != nil {
-		globalState.ResetHistory = append(globalState.ResetHistory, *r)
-		// Cap at 500 entries (FIFO).
+	globalState.Accounts[authID] = r
+	if rec != nil {
+		globalState.ResetHistory = append(globalState.ResetHistory, *rec)
 		if len(globalState.ResetHistory) > 500 {
 			globalState.ResetHistory = globalState.ResetHistory[len(globalState.ResetHistory)-500:]
 		}
-		rec = r
 	}
-	// Also sync logs to the persisted state.
-	globalState.Logs = logs.all()
+	globalState.Logs = entries
 	return rec
 }
 
@@ -480,7 +484,7 @@ func listCodexAccountsForUI() ([]AccountOption, error) {
 	}
 	opts := make([]AccountOption, 0, len(auths))
 	for _, a := range auths {
-		if !strings.EqualFold(a.Provider, "codex") && !strings.EqualFold(a.Type, "codex") {
+		if !resetProvider(a.Provider, a.Type) {
 			continue
 		}
 		// Skip only explicitly disabled accounts. Unavailable (rate-limited)
@@ -503,6 +507,7 @@ func listCodexAccountsForUI() ([]AccountOption, error) {
 			label = a.AuthIndex
 		}
 		opts = append(opts, AccountOption{
+			Provider:  a.Provider,
 			AuthIndex: a.AuthIndex,
 			ID:        a.ID,
 			Name:      label,
@@ -532,10 +537,10 @@ func pluginRegistration() registration {
 	return registration{
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
-			Name:             "Codex Auto Reset",
+			Name:             "Account Reset Manager",
 			Version:          pluginVersion,
 			Author:           "Jeffery",
-			GitHubRepository: "https://github.com/JefferyZhang2019/cpa-plugin-codex-auto-reset",
+			GitHubRepository: "https://github.com/Zeko369/cpa-plugin-codex-auto-reset",
 		},
 		Capabilities: registrationCapabilities{ManagementAPI: true},
 	}
@@ -544,21 +549,21 @@ func pluginRegistration() registration {
 func managementRegistrationResponse() pluginapi.ManagementRegistrationResponse {
 	resources := []pluginapi.ResourceRoute{{
 		Path:        "/status",
-		Menu:        "Codex Auto Reset",
-		Description: "Auto-redeem Codex Reset Bank credits before they expire.",
+		Menu:        "Account Reset Manager",
+		Description: "Redeem expiring Codex credits and Claude reset grants.",
 	}}
 	routes := []pluginapi.ManagementRoute{
-		{Method: http.MethodGet, Path: "/plugins/codex-auto-reset/status"},
-		{Method: http.MethodGet, Path: "/plugins/codex-auto-reset/accounts"},
-		{Method: http.MethodGet, Path: "/plugins/codex-auto-reset/debug/auth-list"},
-		{Method: http.MethodGet, Path: "/plugins/codex-auto-reset/debug/usage"},
-		{Method: http.MethodGet, Path: "/plugins/codex-auto-reset/logs"},
-		{Method: http.MethodPut, Path: "/plugins/codex-auto-reset/settings"},
-		{Method: http.MethodPost, Path: "/plugins/codex-auto-reset/check"},
-		{Method: http.MethodPost, Path: "/plugins/codex-auto-reset/check/all"},
-		{Method: http.MethodPost, Path: "/plugins/codex-auto-reset/reset"},
-		{Method: http.MethodGet, Path: "/plugins/codex-auto-reset/export"},
-		{Method: http.MethodPost, Path: "/plugins/codex-auto-reset/import"},
+		{Method: http.MethodGet, Path: "/plugins/reset-manager/status"},
+		{Method: http.MethodGet, Path: "/plugins/reset-manager/accounts"},
+		{Method: http.MethodGet, Path: "/plugins/reset-manager/debug/auth-list"},
+		{Method: http.MethodGet, Path: "/plugins/reset-manager/debug/usage"},
+		{Method: http.MethodGet, Path: "/plugins/reset-manager/logs"},
+		{Method: http.MethodPut, Path: "/plugins/reset-manager/settings"},
+		{Method: http.MethodPost, Path: "/plugins/reset-manager/check"},
+		{Method: http.MethodPost, Path: "/plugins/reset-manager/check/all"},
+		{Method: http.MethodPost, Path: "/plugins/reset-manager/reset"},
+		{Method: http.MethodGet, Path: "/plugins/reset-manager/export"},
+		{Method: http.MethodPost, Path: "/plugins/reset-manager/import"},
 	}
 	return pluginapi.ManagementRegistrationResponse{Routes: routes, Resources: resources}
 }
@@ -619,12 +624,19 @@ func hostCredsLoader(authID string) (CodexCredentials, ResetClient, error) {
 		if a.ID != authID && a.AuthIndex != authID {
 			continue
 		}
-		if !strings.EqualFold(a.Provider, "codex") && !strings.EqualFold(a.Type, "codex") {
+		if !resetProvider(a.Provider, a.Type) {
 			return CodexCredentials{}, nil, fmt.Errorf("auth %s is not a codex credential (provider=%q type=%q)", authID, a.Provider, a.Type)
+		}
+		if a.Disabled {
+			return CodexCredentials{}, nil, fmt.Errorf("credential is disabled")
 		}
 		raw, err := getAuthJSONViaHost(a.AuthIndex)
 		if err != nil {
 			return CodexCredentials{}, nil, fmt.Errorf("get auth %s: %w", authID, err)
+		}
+		if strings.EqualFold(a.Provider, "claude") || strings.EqualFold(a.Type, "claude") {
+			creds, err := ExtractClaudeCredentials(raw)
+			return creds, &ClaudeClient{}, err
 		}
 		creds, err := ExtractCodexCredentials(raw)
 		if err != nil {
@@ -663,14 +675,14 @@ func getAuthJSONViaHost(authIndex string) (json.RawMessage, error) {
 
 func defaultStatePath() string {
 	// Legacy default: the OS user config dir (e.g. %APPDATA%\CLIProxyAPI\
-	// codex-auto-reset on Windows, ~/.config/CLIProxyAPI/codex-auto-reset/
+	// reset-manager on Windows, ~/.config/CLIProxyAPI/reset-manager/
 	// on Linux). Inside containers this path is ephemeral unless explicitly
 	// volume-mounted, which is why resolveStatePath prefers CPA's auth dir.
 	dir, err := os.UserConfigDir()
 	if err != nil || dir == "" {
 		dir = "."
 	}
-	return filepath.Join(dir, "CLIProxyAPI", "codex-auto-reset", "state.json")
+	return filepath.Join(dir, "CLIProxyAPI", "reset-manager", "state.json")
 }
 
 // resolveStatePath picks the state file location, most-durable first:
@@ -678,12 +690,12 @@ func defaultStatePath() string {
 //  1. explicit absolute state_dir from the plugin's config_yaml (operator
 //     override; CPA's config.yaml lives on a mounted volume in container
 //     deployments, so the override itself is durable)
-//  2. <auth-dir>/plugin-state/codex-auto-reset/state.json — CPA's auth dir,
+//  2. <auth-dir>/plugin-state/reset-manager/state.json — CPA's auth dir,
 //     derived from host.auth.list entry paths. Operators volume-mount the
 //     auth dir (credentials must survive), so state here survives image
 //     updates and container recreates. The subdirectory keeps plugin state
 //     out of CPA's auth-file scan root.
-//  3. <os-user-config-dir>/CLIProxyAPI/codex-auto-reset/state.json — the
+//  3. <os-user-config-dir>/CLIProxyAPI/reset-manager/state.json — the
 //     0.1.7+ default (defaultStatePath)
 //
 // The fallback chain is also the migration chain: configurePlugin moves any
@@ -694,7 +706,7 @@ func resolveStatePath(stateDir string, authEntries []pluginapi.HostAuthFileEntry
 	}
 	for _, e := range authEntries {
 		if e.Path != "" && filepath.IsAbs(e.Path) {
-			return filepath.Join(filepath.Dir(e.Path), "plugin-state", "codex-auto-reset", "state.json")
+			return filepath.Join(filepath.Dir(e.Path), "plugin-state", "reset-manager", "state.json")
 		}
 	}
 	return defaultStatePath()
@@ -704,7 +716,7 @@ func resolveStatePath(stateDir string, authEntries []pluginapi.HostAuthFileEntry
 // CPA's working directory. migrateLegacyState moves it to the new location once,
 // so statistics and logs survive the upgrade.
 func migrateLegacyState(newPath string) {
-	migrateStateFile("codex-auto-reset.state.json", newPath)
+	migrateStateFile("reset-manager.state.json", newPath)
 }
 
 // backfillResetHistoryFromLogs scans persisted logs for "reset verified OK" /
@@ -814,28 +826,18 @@ var (
 // stateSyncPersistInterval. Safe to call from the worker goroutine on every
 // FSM step. A final write on shutdown is handled by SaveStateNow.
 func debouncedSaveState(path string) {
-	lastStatePersistMu.Lock()
-	if time.Since(lastStatePersist) < stateSyncPersistInterval {
-		lastStatePersistMu.Unlock()
-		return
+	if err := SaveStateNow(path); err != nil {
+		// BeforeConsume independently refuses to spend if persistence is unavailable.
+		if globalWorker != nil {
+			globalWorker.Logs().append(LogEntry{Timestamp: time.Now(), Level: "error", Scope: "system", Message: "state persistence failed; redemptions will remain blocked"})
+		}
 	}
-	lastStatePersist = time.Now()
-	lastStatePersistMu.Unlock()
-	pluginStateMu.Lock()
-	snapshot := globalState
-	pluginStateMu.Unlock()
-	_ = saveState(path, snapshot)
 }
 
-// SaveStateNow forces an immediate persist (used on shutdown / reconfigure).
 func SaveStateNow(path string) error {
-	lastStatePersistMu.Lock()
-	lastStatePersist = time.Now()
-	lastStatePersistMu.Unlock()
 	pluginStateMu.Lock()
-	snapshot := globalState
-	pluginStateMu.Unlock()
-	return saveState(path, snapshot)
+	defer pluginStateMu.Unlock()
+	return saveState(path, globalState)
 }
 
 var _ = strings.TrimSpace

@@ -92,7 +92,7 @@ func TestDefaultStatePath_IsAbsoluteAndPlatformAppropriate(t *testing.T) {
 		t.Fatalf("state path should be absolute, got %q (UserConfigDir unavailable in test env?)", p)
 	}
 	// Must contain the plugin-specific segment so multiple CPA plugins don't collide.
-	if !strings.Contains(p, filepath.Join("CLIProxyAPI", "codex-auto-reset")) {
+	if !strings.Contains(p, filepath.Join("CLIProxyAPI", "reset-manager")) {
 		t.Fatalf("state path missing plugin dir segment: %q", p)
 	}
 	if filepath.Base(p) != "state.json" {
@@ -119,7 +119,7 @@ func TestMigrateLegacyState_MigratesAndKeepsBackup(t *testing.T) {
 		Accounts:     map[string]AccountRuntime{},
 		ResetHistory: []ResetRecord{{Timestamp: time.Now(), AuthID: "a", Success: true, PreWeeklyPct: 10, PostWeeklyPct: 100}},
 	}
-	if err := saveState("codex-auto-reset.state.json", legacy); err != nil {
+	if err := saveState("reset-manager.state.json", legacy); err != nil {
 		t.Fatalf("save legacy: %v", err)
 	}
 
@@ -135,7 +135,7 @@ func TestMigrateLegacyState_MigratesAndKeepsBackup(t *testing.T) {
 		t.Fatalf("migration lost reset history: %+v", got.ResetHistory)
 	}
 	// Legacy file must be renamed to .migrated (kept, not deleted).
-	if _, err := os.Stat("codex-auto-reset.state.json.migrated"); err != nil {
+	if _, err := os.Stat("reset-manager.state.json.migrated"); err != nil {
 		t.Fatalf("legacy backup missing: %v", err)
 	}
 }
@@ -152,7 +152,7 @@ func TestMigrateLegacyState_DoesNotOverwriteExisting(t *testing.T) {
 
 	// Legacy file with 2 records.
 	legacy := &PluginState{ResetHistory: []ResetRecord{{AuthID: "legacy"}, {AuthID: "legacy2"}}}
-	if err := saveState("codex-auto-reset.state.json", legacy); err != nil {
+	if err := saveState("reset-manager.state.json", legacy); err != nil {
 		t.Fatalf("save legacy: %v", err)
 	}
 	// New location with 1 record already.

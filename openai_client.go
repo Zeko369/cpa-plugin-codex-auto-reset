@@ -24,7 +24,7 @@ const defaultBaseURL = "https://chatgpt.com"
 // A finite Timeout is mandatory: the worker goroutine drives one FSM per
 // account synchronously, so a hung TCP connection against chatgpt.com would
 // otherwise park that account permanently (spec §3.3, §6.1).
-var openAIDefaultHTTP = &http.Client{Timeout: 30 * time.Second}
+var openAIDefaultHTTP = &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("provider redirects are disabled") }}
 
 // HTTPStatusError carries the status code of a non-2xx response so callers
 // (notably the retry classifier in retry.go) can distinguish 4xx (hard stop)

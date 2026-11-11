@@ -16,6 +16,8 @@ import (
 // endpoints, retry delays, post-reset delay, log limits. Endpoints and OpenAI
 // parameters are NEVER user-configurable.
 type Config struct {
+	RetryInterval   time.Duration `yaml:"retry_interval" json:"-"`
+	ObserveOnly     bool          `yaml:"observe_only" json:"observe_only"`
 	RefreshInterval time.Duration `yaml:"refresh_interval" json:"-"`
 	TriggerLeadTime time.Duration `yaml:"trigger_lead_time" json:"-"`
 	EnabledAccounts []string      `yaml:"enabled_accounts" json:"enabled_accounts"`
@@ -27,12 +29,16 @@ type Config struct {
 // unreadable in the management UI's raw JSON view.
 func (c Config) MarshalJSON() ([]byte, error) {
 	type alias struct {
+		RetryInterval   string   `json:"retry_interval"`
+		ObserveOnly     bool     `json:"observe_only"`
 		RefreshInterval string   `json:"refresh_interval"`
 		TriggerLeadTime string   `json:"trigger_lead_time"`
 		EnabledAccounts []string `json:"enabled_accounts"`
 		StateDir        string   `json:"state_dir,omitempty"`
 	}
 	return json.Marshal(alias{
+		RetryInterval:   formatDuration(c.RetryInterval),
+		ObserveOnly:     c.ObserveOnly,
 		RefreshInterval: formatDuration(c.RefreshInterval),
 		TriggerLeadTime: formatDuration(c.TriggerLeadTime),
 		EnabledAccounts: c.EnabledAccounts,
@@ -57,6 +63,8 @@ func formatDuration(d time.Duration) string {
 // integer form (43200000000000) for Duration fields, for round-trip safety.
 func (c *Config) UnmarshalJSON(raw []byte) error {
 	type alias struct {
+		RetryInterval   json.RawMessage `json:"retry_interval"`
+		ObserveOnly     *bool           `json:"observe_only"`
 		RefreshInterval json.RawMessage `json:"refresh_interval"`
 		TriggerLeadTime json.RawMessage `json:"trigger_lead_time"`
 		EnabledAccounts []string        `json:"enabled_accounts"`
@@ -67,7 +75,16 @@ func (c *Config) UnmarshalJSON(raw []byte) error {
 		return err
 	}
 	c.EnabledAccounts = a.EnabledAccounts
+	c.ObserveOnly = a.ObserveOnly == nil || *a.ObserveOnly
 	c.StateDir = a.StateDir
+	var retryErr error
+	c.RetryInterval, retryErr = parseDurationJSON(a.RetryInterval)
+	if retryErr != nil {
+		return fmt.Errorf("retry_interval: %w", retryErr)
+	}
+	if c.RetryInterval <= 0 {
+		c.RetryInterval = time.Minute
+	}
 	d1, err := parseDurationJSON(a.RefreshInterval)
 	if err != nil {
 		return fmt.Errorf("refresh_interval: %w", err)
@@ -119,6 +136,8 @@ const allAccountsWildcard = "*"
 // the plugin until accounts are opted back in.
 func DefaultConfig() Config {
 	return Config{
+		RetryInterval:   time.Minute,
+		ObserveOnly:     true,
 		RefreshInterval: 12 * time.Hour,
 		TriggerLeadTime: 6 * time.Hour,
 		EnabledAccounts: []string{allAccountsWildcard},
@@ -142,7 +161,7 @@ func configEnablesAll(enabled []string) bool {
 // YAML returns an error; missing fields fall back to defaults via
 // normalizeConfig.
 func parseConfigYAML(raw []byte) (Config, error) {
-	var cfg Config
+	cfg := DefaultConfig()
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return Config{}, fmt.Errorf("parse config yaml: %w", err)
 	}
@@ -157,6 +176,9 @@ func parseConfigYAML(raw []byte) (Config, error) {
 // IDs are dropped. The all-accounts wildcard collapses over any explicit
 // entries ("*" already includes them).
 func normalizeConfig(cfg Config) Config {
+	if cfg.RetryInterval < time.Second {
+		cfg.RetryInterval = time.Minute
+	}
 	if cfg.RefreshInterval < time.Minute {
 		cfg.RefreshInterval = 12 * time.Hour
 	}

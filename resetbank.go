@@ -34,6 +34,8 @@ type AccountFSM struct {
 	Client ResetClient
 	Now    func() time.Time
 	Logf   LogFn
+	// Persist must durably save a full snapshot before any redemption POST.
+	Persist func(AccountRuntime) error
 
 	mu                sync.Mutex
 	state             State
@@ -102,7 +104,7 @@ func (f *AccountFSM) SetNextWake(t time.Time) {
 func (f *AccountFSM) ForceConfirm() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.state == StateRESETTING || f.state == StateVERIFYING {
+	if f.state == StateRESETTING || f.state == StateVERIFYING || f.state == StateHOLD {
 		return
 	}
 	f.scheduledCreditID = ""
@@ -142,6 +144,8 @@ func (f *AccountFSM) stepLocked() time.Time {
 		return f.stepVERIFYING()
 	case StateDONE:
 		return time.Time{}
+	case StateHOLD:
+		return f.stepHOLD()
 	}
 	return time.Time{}
 }
@@ -180,10 +184,18 @@ func (f *AccountFSM) now() time.Time {
 }
 
 // triggerTime returns T = E - L (the moment the trigger window opens).
-func (f *AccountFSM) triggerTime(c Credit) time.Time { return c.ExpiresAt.Add(-f.Cfg.TriggerLeadTime) }
+func (f *AccountFSM) triggerTime(c Credit) time.Time {
+	t := c.ExpiresAt.Add(-f.Cfg.TriggerLeadTime)
+	if c.StartsAt.After(t) {
+		t = c.StartsAt
+	}
+	return t
+}
 
 // armThreshold returns M = T - R (the moment we enter ARMED).
-func (f *AccountFSM) armThreshold(c Credit) time.Time { return f.triggerTime(c).Add(-f.Cfg.RefreshInterval) }
+func (f *AccountFSM) armThreshold(c Credit) time.Time {
+	return f.triggerTime(c).Add(-f.Cfg.RefreshInterval)
+}
 
 func (f *AccountFSM) log(level, msg, nextAction string, nextAt *time.Time, details map[string]any) {
 	if f.Logf != nil {
@@ -208,6 +220,7 @@ func (f *AccountFSM) stepIDLE() time.Time {
 		f.lastSnapshot = snap
 	}
 	avail := availableCreditsSorted(snap.Credits, now)
+	f.lastSnapshot = snap
 	if len(avail) == 0 {
 		next := now.Add(f.Cfg.RefreshInterval)
 		f.nextWake = next
@@ -265,6 +278,7 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 		return time.Time{}
 	}
 	avail := availableCreditsSorted(snap.Credits, now)
+	f.lastSnapshot = snap
 	var target Credit
 	if f.manualReset {
 		if len(avail) > 0 {
@@ -282,6 +296,15 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 		f.state = StateDONE
 		f.log("warn", "target credit missing or unavailable before reset", "abandon", nil, nil)
 		return time.Time{}
+	}
+	if target.BlockedReason != "" || f.Cfg.ObserveOnly {
+		reason := target.BlockedReason
+		if f.Cfg.ObserveOnly {
+			reason = "observation only; redemption disabled"
+		}
+		next := now.Add(time.Minute)
+		f.log("info", reason, "recheck eligibility", &next, nil)
+		return next
 	}
 	if !f.manualReset {
 		if target.ExpiresAt.IsZero() {
@@ -310,7 +333,12 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 		return time.Time{}
 	}
 	snap.WeeklyPct = usage.WeeklyPct
+	if len(usage.Limits) > 0 {
+		snap.Limits = usage.Limits
+	}
 	f.attempt = ResetAttempt{
+		Identity:        f.Creds.Identity,
+		ExpiresAt:       target.ExpiresAt,
 		RedeemRequestID: uuid.NewString(),
 		TargetCreditID:  target.ID,
 		PreSnapshot:     snap,
@@ -323,17 +351,57 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 			shortID(target.ID), snap.AvailableCount, snap.WeeklyPct),
 		"send reset request", nil,
 		map[string]any{
-			"credit_id":           target.ID,
-			"pre_credits":         snap.AvailableCount,
-			"pre_weekly_pct":      snap.WeeklyPct,
-			"target_expires_at":   target.ExpiresAt,
-			"redeem_request_id":   f.attempt.RedeemRequestID,
+			"credit_id":         target.ID,
+			"pre_credits":       snap.AvailableCount,
+			"pre_weekly_pct":    snap.WeeklyPct,
+			"target_expires_at": target.ExpiresAt,
+			"redeem_request_id": f.attempt.RedeemRequestID,
 		})
 	return f.now()
 }
 
 func (f *AccountFSM) stepRESETTING() time.Time {
 	now := f.now()
+	if f.Cfg.ObserveOnly {
+		return now.Add(time.Minute)
+	}
+	if f.attempt.Identity != f.Creds.Identity || f.attempt.RedeemRequestID == "" || f.attempt.TargetCreditID == "" {
+		return f.hold("credential identity or pending intent changed")
+	}
+	// Reconcile a possibly successful POST before considering any retry. Never
+	// replace a missing target with another credit or another unit of a grant.
+	if f.attempt.Pending {
+		snap, err := f.Client.ListCredits(f.Creds)
+		if err != nil {
+			return now.Add(time.Minute)
+		}
+		f.lastSnapshot = snap
+		if targetMissing(snap, f.attempt.TargetCreditID) {
+			f.state = StateVERIFYING
+			f.verifyDue = now
+			return now
+		}
+		for _, c := range snap.Credits {
+			if c.ID == f.attempt.TargetCreditID && c.BlockedReason != "" {
+				return now.Add(time.Minute)
+			}
+		}
+	}
+	if !f.attempt.ExpiresAt.IsZero() && !now.Before(f.attempt.ExpiresAt) {
+		return f.hold("pending credit expired; inspect before resuming")
+	}
+	if f.attempt.ExpiresAt.IsZero() && now.Sub(f.attempt.StartedAt) >= time.Hour {
+		return f.hold("pending manual redemption exceeded retry window")
+	}
+	if f.Creds.Provider == "claude" && f.attempt.Ambiguous && now.Sub(f.attempt.StartedAt) >= 10*time.Minute {
+		return f.hold("Claude ambiguous attempt exceeded safe retry window")
+	}
+	f.attempt.Pending = true
+	if f.Persist != nil {
+		if err := f.Persist(f.runtimeLocked()); err != nil {
+			return f.hold("cannot persist redemption intent; no request sent")
+		}
+	}
 	resp, err := f.Client.Consume(f.Creds, f.attempt.RedeemRequestID, f.attempt.TargetCreditID)
 	switch classifyConsume(resp, err) {
 	case decisionSuccess:
@@ -352,6 +420,9 @@ func (f *AccountFSM) stepRESETTING() time.Time {
 			})
 		return f.verifyDue
 	case decisionStop:
+		if f.attempt.Ambiguous {
+			return f.hold("refusal after an uncertain redemption; retaining request ID")
+		}
 		f.state = StateDONE
 		msg := fmt.Sprintf("reset stopped: server returned %s", resp.Code)
 		if err != nil {
@@ -360,16 +431,20 @@ func (f *AccountFSM) stepRESETTING() time.Time {
 		f.log("warn", msg, "abandon", nil, map[string]any{"redeem_request_id": f.attempt.RedeemRequestID})
 		return time.Time{}
 	case decisionRetry:
+		f.attempt.Ambiguous = true
 		f.attempt.Attempt++
-		if f.attempt.Attempt > len(resetRetryDelays) {
-			f.state = StateDONE
+		if f.Cfg.RetryInterval <= 0 && f.attempt.Attempt > len(resetRetryDelays) {
+			f.state = StateHOLD
 			f.log("error",
 				fmt.Sprintf("retries exhausted after %d attempts; last error: %v", f.attempt.Attempt-1, err),
 				"abandon", nil,
 				map[string]any{"redeem_request_id": f.attempt.RedeemRequestID})
-			return time.Time{}
+			return now.Add(f.Cfg.RefreshInterval)
 		}
 		backoff := backoffForAttempt(f.attempt.Attempt)
+		if f.Cfg.RetryInterval > 0 {
+			backoff = f.Cfg.RetryInterval
+		}
 		f.attempt.NextRetryAt = now.Add(backoff)
 		f.nextWake = f.attempt.NextRetryAt
 		f.log("warn",
@@ -384,17 +459,17 @@ func (f *AccountFSM) stepRESETTING() time.Time {
 func (f *AccountFSM) stepVERIFYING() time.Time {
 	credits, err := f.Client.ListCredits(f.Creds)
 	if err != nil {
-		f.state = StateDONE
+		f.state = StateHOLD
 		f.log("error", fmt.Sprintf("verification failed: %v", err), "abandon", nil,
 			map[string]any{"redeem_request_id": f.attempt.RedeemRequestID, "target_credit_id": f.attempt.TargetCreditID})
-		return time.Time{}
+		return f.now().Add(f.Cfg.RefreshInterval)
 	}
 	usage, err := f.Client.GetUsage(f.Creds)
 	if err != nil {
-		f.state = StateDONE
+		f.state = StateHOLD
 		f.log("error", fmt.Sprintf("verification failed: %v", err), "abandon", nil,
 			map[string]any{"redeem_request_id": f.attempt.RedeemRequestID, "target_credit_id": f.attempt.TargetCreditID})
-		return time.Time{}
+		return f.now().Add(f.Cfg.RefreshInterval)
 	}
 	// Update lastSnapshot with post-reset data so the UI shows the new state.
 	credits.WeeklyPct = usage.WeeklyPct
@@ -409,23 +484,41 @@ func (f *AccountFSM) stepVERIFYING() time.Time {
 		}
 	}
 	countDown1 := credits.AvailableCount == f.attempt.PreSnapshot.AvailableCount-1
-	quotaUp := usage.WeeklyPct >= 100 || usage.WeeklyPct > f.attempt.PreSnapshot.WeeklyPct
+	quotaUp := usage.WeeklyPct >= 0 && f.attempt.PreSnapshot.WeeklyPct >= 0 && (usage.WeeklyPct >= 100 || usage.WeeklyPct > f.attempt.PreSnapshot.WeeklyPct)
+	if f.Creds.Provider == "claude" {
+		quotaUp = false
+		for _, c := range f.attempt.PreSnapshot.Credits {
+			if c.ID != f.attempt.TargetCreditID {
+				continue
+			}
+			for _, k := range c.Clears {
+				before, bok := f.attempt.PreSnapshot.Limits[k]
+				after, aok := credits.Limits[k]
+				if bok && aok && after < before {
+					quotaUp = true
+				}
+			}
+		}
+	}
 
 	f.state = StateDONE
 	// Build detailed details map with full before/after snapshot.
 	details := map[string]any{
-		"credit_id":            f.attempt.TargetCreditID,
-		"redeem_request_id":    f.attempt.RedeemRequestID,
-		"pre_credits":          f.attempt.PreSnapshot.AvailableCount,
-		"post_credits":         credits.AvailableCount,
-		"pre_weekly_pct":       f.attempt.PreSnapshot.WeeklyPct,
-		"post_weekly_pct":      usage.WeeklyPct,
-		"target_gone":          targetGone,
-		"count_down_1":         countDown1,
-		"quota_recovered":      quotaUp,
+		"credit_id":         f.attempt.TargetCreditID,
+		"redeem_request_id": f.attempt.RedeemRequestID,
+		"pre_credits":       f.attempt.PreSnapshot.AvailableCount,
+		"post_credits":      credits.AvailableCount,
+		"pre_weekly_pct":    f.attempt.PreSnapshot.WeeklyPct,
+		"post_weekly_pct":   usage.WeeklyPct,
+		"target_gone":       targetGone,
+		"count_down_1":      countDown1,
+		"quota_recovered":   quotaUp,
 	}
 
 	success := targetGone && countDown1 && quotaUp
+	if !success {
+		f.state = StateHOLD
+	}
 
 	switch {
 	case success:
@@ -460,6 +553,9 @@ func (f *AccountFSM) stepVERIFYING() time.Time {
 		PostCredits:   credits.AvailableCount,
 	}
 
+	if !success {
+		return f.now().Add(f.Cfg.RefreshInterval)
+	}
 	return time.Time{}
 }
 

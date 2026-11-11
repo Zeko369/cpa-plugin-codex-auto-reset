@@ -308,7 +308,7 @@ func TestWorker_ManagementCheckRespectsPinnedCycle(t *testing.T) {
 			w, fsm, fc, clock, trigger := armedWorkerFixture(t)
 			listsBefore := fc.listCalls
 			h := newManagementHandlers(&PluginState{Config: w.cfg}, "", w)
-			status, body, _ := h.handle("POST", "/v0/management/plugins/codex-auto-reset/"+route, nil, []byte(`{"auth_index":"acct"}`))
+			status, body, _ := h.handle("POST", "/v0/management/plugins/reset-manager/"+route, nil, []byte(`{"auth_index":"acct"}`))
 			// Check on an ARMED account keeps the pinned trigger wake and
 			// burns no list call; the confirm at T revalidates anyway.
 			if status != 200 || !fsm.NextWake().Equal(trigger) {
@@ -410,7 +410,7 @@ func TestWorker_ManagementManualResetFarFuture(t *testing.T) {
 					fc.credits["b"].ExpiresAt = time.Time{}
 				}
 				h := newManagementHandlers(&PluginState{Config: w.cfg}, "", w)
-				status, body, _ := h.handle("POST", "/v0/management/plugins/codex-auto-reset/reset", nil, []byte(`{"auth_index":"acct"}`))
+				status, body, _ := h.handle("POST", "/v0/management/plugins/reset-manager/reset", nil, []byte(`{"auth_index":"acct"}`))
 				if status != 200 || fsm.State() != StateCONFIRMING || !fsm.NextWake().Equal(clock.t) {
 					t.Fatalf("manual reset: status=%d body=%s state=%s wake=%v", status, body, fsm.State(), fsm.NextWake())
 				}

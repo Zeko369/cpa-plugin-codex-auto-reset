@@ -234,8 +234,8 @@ func TestFSM_RetriesExhausted_GivesUp(t *testing.T) {
 
 	drive(t, fsm, clock)
 
-	if fsm.State() != StateDONE {
-		t.Fatalf("final state = %s, want DONE", fsm.State())
+	if fsm.State() != StateHOLD {
+		t.Fatalf("final state = %s, want HOLD", fsm.State())
 	}
 	if fc.consumeCalls != 6 {
 		t.Fatalf("consume calls = %d, want 6 (1 + 5 retries)", fc.consumeCalls)
@@ -334,8 +334,8 @@ func TestFSM_WrongCreditConsumed_DetectsMismatch(t *testing.T) {
 			"sooner": {ID: "sooner", Status: "available", ExpiresAt: E1},
 			"later":  {ID: "later", Status: "available", ExpiresAt: E2},
 		},
-		weeklyPct:     25,
-		consumeResp:   ConsumeResponse{Code: ConsumeCodeReset, WindowsReset: 2},
+		weeklyPct:      25,
+		consumeResp:    ConsumeResponse{Code: ConsumeCodeReset, WindowsReset: 2},
 		deductCreditID: "later", // server bug: deducts the wrong credit
 	}
 	clock := &fakeClock{t: E1.Add(-12 * time.Hour)}
@@ -347,8 +347,8 @@ func TestFSM_WrongCreditConsumed_DetectsMismatch(t *testing.T) {
 
 	drive(t, fsm, clock)
 
-	if fsm.State() != StateDONE {
-		t.Fatalf("final state = %s, want DONE", fsm.State())
+	if fsm.State() != StateHOLD {
+		t.Fatalf("final state = %s, want HOLD", fsm.State())
 	}
 	if fc.consumeCalls != 1 {
 		t.Fatalf("consume calls = %d, want 1", fc.consumeCalls)
@@ -395,7 +395,7 @@ func TestFSM_QuotaLegIsLive_PartialWhenQuotaDoesNotRecover(t *testing.T) {
 	}
 	fsm := NewAccountFSM("acct1", CodexCredentials{AccessToken: "t"}, cfg, fc, clock.Now, logf)
 
-	for i := 0; i < 50 && fsm.State() != StateDONE; i++ {
+	for i := 0; i < 50 && fsm.State() != StateHOLD; i++ {
 		next := fsm.Step()
 		if next.IsZero() {
 			break
@@ -403,8 +403,8 @@ func TestFSM_QuotaLegIsLive_PartialWhenQuotaDoesNotRecover(t *testing.T) {
 		clock.t = next
 	}
 
-	if fsm.State() != StateDONE {
-		t.Fatalf("final state = %s, want DONE", fsm.State())
+	if fsm.State() != StateHOLD {
+		t.Fatalf("final state = %s, want HOLD", fsm.State())
 	}
 	if fc.usageCalls == 0 {
 		t.Fatalf("GetUsage was never called at confirm time — quota leg is dead (regression of I1)")

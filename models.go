@@ -15,29 +15,38 @@ const (
 	StateRESETTING  State = "RESETTING"
 	StateVERIFYING  State = "VERIFYING"
 	StateDONE       State = "DONE"
+	StateHOLD       State = "HOLD"
 )
 
 // Credit models one reset-credit row from GET /rate-limit-reset-credits
 // (spec §2.1). A zero ExpiresAt means "never expires".
 type Credit struct {
-	ID        string    `json:"id"`
-	Status    string    `json:"status"`
-	ExpiresAt time.Time `json:"expires_at"`
+	ID            string    `json:"id"`
+	Status        string    `json:"status"`
+	ExpiresAt     time.Time `json:"expires_at"`
+	StartsAt      time.Time `json:"starts_at,omitempty"`
+	BlockedReason string    `json:"blocked_reason,omitempty"`
+	Clears        []string  `json:"clears,omitempty"`
 }
 
 // Snapshot is a (credits, weekly %) pair captured at key moments during a
 // reset cycle: pre-reset confirmation, and post-reset verification.
 type Snapshot struct {
-	AvailableCount int       `json:"available_count"`
-	Credits        []Credit  `json:"credits"`
-	WeeklyPct      int       `json:"weekly_pct"`
-	CapturedAt     time.Time `json:"captured_at"`
+	Limits         map[string]float64 `json:"limits,omitempty"`
+	AvailableCount int                `json:"available_count"`
+	Credits        []Credit           `json:"credits"`
+	WeeklyPct      int                `json:"weekly_pct"`
+	CapturedAt     time.Time          `json:"captured_at"`
 }
 
 // ResetAttempt tracks one logical reset cycle (spec §5.1). A single
 // RedeemRequestID is minted on entry to RESETTING and reused for every retry
 // in that cycle, so OpenAI dedupes and never double-consumes.
 type ResetAttempt struct {
+	Identity        string    `json:"identity,omitempty"`
+	ExpiresAt       time.Time `json:"expires_at,omitempty"`
+	Pending         bool      `json:"pending,omitempty"`
+	Ambiguous       bool      `json:"ambiguous,omitempty"`
 	RedeemRequestID string    `json:"redeem_request_id"`
 	TargetCreditID  string    `json:"target_credit_id"`
 	PreSnapshot     Snapshot  `json:"pre_snapshot"`

@@ -8,15 +8,16 @@ import (
 	"time"
 )
 
-const pluginID = "codex-auto-reset"
+const pluginID = "reset-manager"
 
-// AccountLister returns the Codex accounts discoverable through CPA (via the
+// AccountLister returns the Codex and Claude accounts discoverable through CPA (via the
 // host.auth.list ABI callback). Injected from main.go so management.go has no
 // direct C/ABI dependency. Returns one entry per Codex auth file, sorted.
 type AccountLister func() ([]AccountOption, error)
 
 // AccountOption is one selectable Codex account for the UI's checkbox list.
 type AccountOption struct {
+	Provider  string `json:"provider,omitempty"`
 	AuthIndex string `json:"auth_index"`
 	ID        string `json:"id,omitempty"` // credential ID / file name (e.g. codex-44411af1-email-team.json)
 	Name      string `json:"name"`         // human-readable display label (id, then name, then email, then auth_index)
@@ -54,8 +55,8 @@ func isResourcePath(path string) bool {
 }
 
 // handle dispatches one management or resource request. rawPath is the
-// original CPA request path (e.g. /v0/management/plugins/codex-auto-reset/
-// status or /v0/resource/plugins/codex-auto-reset/status); it is used to
+// original CPA request path (e.g. /v0/management/plugins/reset-manager/
+// status or /v0/resource/plugins/reset-manager/status); it is used to
 // distinguish HTML (resource) from JSON (management) responses for /status.
 func (h *managementHandlers) handle(method, rawPath string, headers http.Header, body []byte) (int, []byte, string) {
 	path := normalizePath(rawPath)
@@ -117,9 +118,9 @@ func (h *managementHandlers) handle(method, rawPath string, headers http.Header,
 
 // normalizePath strips every CPA-known prefix from a management or resource
 // path so dispatch can switch on a canonical suffix (e.g. "/status",
-// "/settings"). Both /v0/management/plugins/codex-auto-reset/status and
-// /v0/resource/plugins/codex-auto-reset/status normalize to /status.
-// A bare "/codex-auto-reset/status" (without the /v0/... prefix) is also
+// "/settings"). Both /v0/management/plugins/reset-manager/status and
+// /v0/resource/plugins/reset-manager/status normalize to /status.
+// A bare "/reset-manager/status" (without the /v0/... prefix) is also
 // accepted for resilience.
 func normalizePath(path string) string {
 	for _, prefix := range []string{
@@ -141,8 +142,8 @@ func normalizePath(path string) string {
 }
 
 func (h *managementHandlers) statusJSON() (int, []byte) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	pluginStateMu.Lock()
+	defer pluginStateMu.Unlock()
 	// Deep-copy accounts so the JSON encoder doesn't race with the worker.
 	accts := make(map[string]AccountRuntime, len(h.state.Accounts))
 	for k, v := range h.state.Accounts {
@@ -161,15 +162,12 @@ func (h *managementHandlers) statusJSON() (int, []byte) {
 	return jsonOK(out)
 }
 
-// accountsJSON returns the list of Codex accounts CPA knows about, annotated
-// with whether each is currently enabled. The UI renders these as checkboxes.
-// debugUsage fetches the raw /wham/usage response for the first enabled
-// account and returns it verbatim. Temporary diagnostic to determine the
-// real wire shape of weekly quota data.
+// debugUsage uses the account's provider adapter. Credentials must never be
+// sent to a different provider just because this diagnostic selects it first.
 func (h *managementHandlers) debugUsage() (int, []byte, string) {
-	h.mu.Lock()
+	pluginStateMu.Lock()
 	enabled := h.state.Config.EnabledAccounts
-	h.mu.Unlock()
+	pluginStateMu.Unlock()
 	if len(enabled) == 0 {
 		st, b := jsonStatus(http.StatusBadRequest, map[string]any{"error": "no enabled accounts"})
 		return st, b, "application/json"
@@ -189,24 +187,18 @@ func (h *managementHandlers) debugUsage() (int, []byte, string) {
 		st, b := jsonStatus(http.StatusServiceUnavailable, map[string]any{"error": "no FSM available"})
 		return st, b, "application/json"
 	}
-	// Do a raw HTTP GET to see the actual response body.
-	cli := &OpenAIClient{}
-	req, err := http.NewRequest(http.MethodGet, defaultBaseURL+usageEndpointPath, nil)
-	if err != nil {
-		st, b := jsonStatus(http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return st, b, "application/json"
-	}
-	req.Header.Set("Authorization", "Bearer "+fsm.Creds.AccessToken)
-	if fsm.Creds.ChatGPTAccountID != "" {
-		req.Header.Set("Chatgpt-Account-Id", fsm.Creds.ChatGPTAccountID)
-	}
-	req.Header.Set("User-Agent", codexUserAgent)
-	body, err := cli.do(req)
+	creds, client, err := h.worker.loader(fsm.AuthID)
 	if err != nil {
 		st, b := jsonStatus(http.StatusBadGateway, map[string]any{"error": err.Error()})
 		return st, b, "application/json"
 	}
-	return http.StatusOK, body, "application/json"
+	snapshot, err := client.GetUsage(creds)
+	if err != nil {
+		st, b := jsonStatus(http.StatusBadGateway, map[string]any{"error": err.Error()})
+		return st, b, "application/json"
+	}
+	st, b := jsonOK(snapshot)
+	return st, b, "application/json"
 }
 
 // debugAuthList dumps the raw host.auth.list result with per-entry filter
@@ -265,13 +257,13 @@ func (h *managementHandlers) accountsJSON() (int, []byte) {
 		return jsonStatus(http.StatusBadGateway, map[string]any{"error": "list accounts: " + err.Error()})
 	}
 	// Mark enabled ones. In wildcard mode every listed account is enabled.
-	h.mu.Lock()
+	pluginStateMu.Lock()
 	enabled := make(map[string]bool, len(h.state.Config.EnabledAccounts))
 	for _, id := range h.state.Config.EnabledAccounts {
 		enabled[id] = true
 	}
 	all := configEnablesAll(h.state.Config.EnabledAccounts)
-	h.mu.Unlock()
+	pluginStateMu.Unlock()
 	for i := range opts {
 		opts[i].Enabled = all || enabled[opts[i].AuthIndex]
 	}
@@ -280,6 +272,7 @@ func (h *managementHandlers) accountsJSON() (int, []byte) {
 
 func (h *managementHandlers) putSettings(body []byte) (int, []byte) {
 	var req struct {
+		ObserveOnly     *bool    `json:"observe_only"`
 		RefreshInterval string   `json:"refresh_interval"`
 		TriggerLeadTime string   `json:"trigger_lead_time"`
 		EnabledAccounts []string `json:"enabled_accounts"`
@@ -293,11 +286,15 @@ func (h *managementHandlers) putSettings(body []byte) (int, []byte) {
 		req.RefreshInterval = parsed.RefreshInterval.String()
 		req.TriggerLeadTime = parsed.TriggerLeadTime.String()
 		req.EnabledAccounts = parsed.EnabledAccounts
+		req.ObserveOnly = &parsed.ObserveOnly
 	}
-	h.mu.Lock()
+	pluginStateMu.Lock()
 	// state_dir is operator-only (config_yaml); a UI save must not drop it.
-	cfg := Config{EnabledAccounts: req.EnabledAccounts, StateDir: h.state.Config.StateDir}
-	h.mu.Unlock()
+	cfg := Config{EnabledAccounts: req.EnabledAccounts, StateDir: h.state.Config.StateDir, ObserveOnly: h.state.Config.ObserveOnly, RetryInterval: h.state.Config.RetryInterval}
+	if req.ObserveOnly != nil {
+		cfg.ObserveOnly = *req.ObserveOnly
+	}
+	pluginStateMu.Unlock()
 	if req.RefreshInterval != "" {
 		d, err := time.ParseDuration(req.RefreshInterval)
 		if err != nil {
@@ -313,10 +310,10 @@ func (h *managementHandlers) putSettings(body []byte) (int, []byte) {
 		cfg.TriggerLeadTime = d
 	}
 	cfg = normalizeConfig(cfg)
-	h.mu.Lock()
+	pluginStateMu.Lock()
 	h.state.Config = cfg
-	h.mu.Unlock()
-	if err := saveState(h.statePath, h.state); err != nil {
+	pluginStateMu.Unlock()
+	if err := h.saveState(); err != nil {
 		return jsonStatus(http.StatusInternalServerError, map[string]any{"error": err.Error()})
 	}
 	// Restart the worker so the new config (especially enabled_accounts and
@@ -326,6 +323,7 @@ func (h *managementHandlers) putSettings(body []byte) (int, []byte) {
 		h.OnSettingsChanged()
 	}
 	return jsonOK(map[string]any{
+		"observe_only":      cfg.ObserveOnly,
 		"refresh_interval":  formatDuration(cfg.RefreshInterval),
 		"trigger_lead_time": formatDuration(cfg.TriggerLeadTime),
 		"enabled_accounts":  cfg.EnabledAccounts,
@@ -354,6 +352,12 @@ func (h *managementHandlers) checkOne(body []byte) (int, []byte) {
 }
 
 func (h *managementHandlers) resetOne(body []byte) (int, []byte) {
+	pluginStateMu.Lock()
+	observe := h.state.Config.ObserveOnly
+	pluginStateMu.Unlock()
+	if observe {
+		return jsonStatus(http.StatusConflict, map[string]any{"error": "observation only; redemption disabled"})
+	}
 	var req struct {
 		AuthIndex string `json:"auth_index"`
 	}
@@ -369,8 +373,8 @@ func (h *managementHandlers) resetOne(body []byte) (int, []byte) {
 }
 
 func (h *managementHandlers) exportState() (int, []byte) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	pluginStateMu.Lock()
+	defer pluginStateMu.Unlock()
 	raw, _ := json.MarshalIndent(h.state, "", "  ")
 	return http.StatusOK, raw
 }
@@ -384,11 +388,36 @@ func (h *managementHandlers) importState(body []byte) (int, []byte) {
 	if s.Accounts == nil {
 		s.Accounts = map[string]AccountRuntime{}
 	}
-	h.mu.Lock()
+	// Import is an offline/observation operation. Stop the observer before
+	// replacing snapshots so its next save cannot overwrite the imported intent.
+	lifecycleMu.Lock()
+	pluginStateMu.Lock()
+	if !h.state.Config.ObserveOnly || !s.Config.ObserveOnly {
+		pluginStateMu.Unlock()
+		lifecycleMu.Unlock()
+		return jsonStatus(http.StatusConflict, map[string]any{"error": "enable observation mode before importing; imported state must also be observation only"})
+	}
+	for _, a := range h.state.Accounts {
+		if a.Attempt.Pending || a.State == StateHOLD || a.State == StateRESETTING || a.State == StateVERIFYING {
+			pluginStateMu.Unlock()
+			lifecycleMu.Unlock()
+			return jsonStatus(http.StatusConflict, map[string]any{"error": "cannot replace unresolved reset intent; reconcile it first"})
+		}
+	}
+	pluginStateMu.Unlock()
+	stopCurrentWorker()
+	pluginStateMu.Lock()
 	h.state.Config = s.Config
 	h.state.Accounts = s.Accounts
-	h.mu.Unlock()
-	if err := saveState(h.statePath, h.state); err != nil {
+	h.state.ResetHistory = s.ResetHistory
+	h.state.Logs = s.Logs
+	pluginStateMu.Unlock()
+	err := h.saveState()
+	lifecycleMu.Unlock()
+	if h.OnSettingsChanged != nil {
+		h.OnSettingsChanged()
+	}
+	if err != nil {
 		return jsonStatus(http.StatusInternalServerError, map[string]any{"error": err.Error()})
 	}
 	return jsonOK(map[string]any{"imported": true})
@@ -408,8 +437,8 @@ func jsonStatus(status int, v any) (int, []byte) {
 }
 
 // renderStatusHTML returns the bilingual resource page. The page is static
-// HTML with inline CSS and JS; it fetches /v0/management/plugins/codex-
-// auto-reset/status and /logs at runtime using a user-supplied CPA Management
+// HTML with inline CSS and JS; it fetches the reset-manager status and logs
+// at runtime using a user-supplied CPA Management
 // key. No secrets are embedded in the HTML.
 func renderStatusHTML(state *PluginState) string {
 	_ = state
@@ -418,7 +447,7 @@ func renderStatusHTML(state *PluginState) string {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Codex Auto Reset</title>
+  <title>Account Reset Manager</title>
   <style>
     :root {
       --bg: #f6f8fa;
@@ -696,7 +725,7 @@ func renderStatusHTML(state *PluginState) string {
     <header class="topbar">
       <div class="brand">
         <div class="logo">CR</div>
-        <h1 data-i18n="title">Codex Auto Reset</h1>
+        <h1 data-i18n="title">Account Reset Manager</h1>
       </div>
       <div class="topbar-actions">
         <div class="locale-switch" id="localeSwitch">
@@ -742,12 +771,13 @@ func renderStatusHTML(state *PluginState) string {
                 <input type="checkbox" id="allAccountsToggle">
                 <span data-i18n="allAccounts">All accounts (automatic)</span>
               </label>
-              <p class="setting-help" data-i18n="allAccountsHelp">Includes every Codex account CPA knows, now and in the future. Uncheck to pick accounts individually.</p>
+              <p class="setting-help" data-i18n="allAccountsHelp">Includes every Codex and Claude account CPA knows, now and in the future. Uncheck to pick accounts individually.</p>
               <div id="accountCheckboxes" class="acct-list">
                 <span class="muted" data-i18n="loadAccountsPrompt">Click "Load status" to list accounts.</span>
               </div>
             </div>
             <div class="actions">
+              <label class="toggle"><input type="checkbox" id="observeOnly"><span data-i18n="observeOnly">Observe only (never redeem)</span></label>
               <button id="saveSettings" type="button" class="primary" data-i18n="save">Save settings</button>
             </div>
           </div>
@@ -771,7 +801,7 @@ func renderStatusHTML(state *PluginState) string {
   <script>
     const I18N = {
       en: {
-        title: "Codex Auto Reset",
+        title: "Account Reset Manager",
         connection: "Connection",
         settings: "Settings",
         managementKey: "CPA management key",
@@ -782,12 +812,13 @@ func renderStatusHTML(state *PluginState) string {
         refreshInterval: "Refresh interval",
         triggerLeadTime: "Trigger lead time",
         enabledAccounts: "Enabled accounts",
+        observeOnly: "Observe only (never redeem)",
         allAccounts: "All accounts (automatic)",
-        allAccountsHelp: "Includes every Codex account CPA knows, now and in the future. Uncheck to pick accounts individually.",
+        allAccountsHelp: "Includes every Codex and Claude account CPA knows, now and in the future. Uncheck to pick accounts individually.",
         save: "Save settings",
         loadPrompt: "Enter the CPA management key and click Load status.",
         loadAccountsPrompt: "Click \"Load status\" to list accounts.",
-        noAccountsFound: "No Codex accounts found in CPA.",
+        noAccountsFound: "No Codex and Claude accounts found in CPA.",
         logs: "Logs",
         check: "Check",
         checkAll: "Check all",
@@ -823,6 +854,7 @@ func renderStatusHTML(state *PluginState) string {
         refreshInterval: "\u5237\u65b0\u95f4\u9694",
         triggerLeadTime: "\u63d0\u524d\u89e6\u53d1\u65f6\u95f4",
         enabledAccounts: "\u542f\u7528\u7684\u8d26\u53f7",
+        observeOnly: "仅观察（不兑换重置）",
         allAccounts: "\u5168\u90e8\u8d26\u53f7\uff08\u81ea\u52a8\uff09",
         allAccountsHelp: "\u81ea\u52a8\u5305\u542b CPA \u4e2d\u7684\u6240\u6709 Codex \u8d26\u53f7\uff08\u542b\u65e5\u540e\u65b0\u589e\uff09\u3002\u53d6\u6d88\u52fe\u9009\u53ef\u624b\u52a8\u9009\u62e9\u8d26\u53f7\u3002",
         loadAccountsPrompt: "\u70b9\u51fb\u201c\u52a0\u8f7d\u72b6\u6001\u201d\u4ee5\u5217\u51fa\u8d26\u53f7\u3002",
@@ -880,10 +912,10 @@ func renderStatusHTML(state *PluginState) string {
     // its issue #17. A root deployment yields an empty prefix.
     function apiRootPrefix() {
       const suffixes = [
-        '/v0/resource/plugins/codex-auto-reset/status',
-        '/v0/management/plugins/codex-auto-reset/status',
-        '/v0/resource/plugins/codex-auto-reset',
-        '/v0/management/plugins/codex-auto-reset'
+        '/v0/resource/plugins/reset-manager/status',
+        '/v0/management/plugins/reset-manager/status',
+        '/v0/resource/plugins/reset-manager',
+        '/v0/management/plugins/reset-manager'
       ];
       const path = location.pathname;
       for (const suffix of suffixes) {
@@ -1011,6 +1043,8 @@ func renderStatusHTML(state *PluginState) string {
           return zh ? (time ? '\u5c06\u5728 ' + time + ' \u9a8c\u8bc1\u91cd\u7f6e\u7ed3\u679c' : '\u6b63\u5728\u9a8c\u8bc1') : (time ? 'verify at ' + time : 'verifying');
         case 'DONE':
           return zh ? '\u672c\u8f6e\u5b8c\u6210\uff0c\u5373\u5c06\u6062\u590d\u5de1\u67e5' : 'cycle complete, resuming patrol';
+        case 'HOLD':
+          return 'Paused for reconciliation; reset intent retained';
         default:
           return zh ? '\u672a\u77e5\u72b6\u6001' : 'unknown';
       }
@@ -1048,11 +1082,14 @@ func renderStatusHTML(state *PluginState) string {
         const a = accts[id] || {};
         const state = a.state || 'IDLE';
         const snap = a.last_snapshot || (a.attempt && a.attempt.pre_snapshot) || {};
-        const credits = snap.available_count == null ? '-' : snap.available_count;
-        const weeklyPct = (typeof snap.weekly_pct === 'number' && snap.weekly_pct >= 0) ? snap.weekly_pct : null;
+        const snapshotKnown = snap.captured_at && !snap.captured_at.startsWith('0001-');
+        const credits = !snapshotKnown || snap.available_count == null ? '-' : snap.available_count;
+        const weeklyPct = (snapshotKnown && typeof snap.weekly_pct === 'number' && snap.weekly_pct >= 0) ? snap.weekly_pct : null;
         const weekly = weeklyPct == null ? '-' : weeklyPct + '%';
         const nextAt = a.next_wake || '';
-        const displayName = escapeHTML(accountNameMap[id] || id);
+        const provider = a.provider || 'codex';
+        const blocked = (snap.credits || []).filter(c => c.blocked_reason).map(c => c.blocked_reason).join('; ');
+        const displayName = escapeHTML(provider.toUpperCase() + " · " + (accountNameMap[id] || id));
 
         // Weekly progress bar.
         var fillClass = 'unknown';
@@ -1119,11 +1156,12 @@ func renderStatusHTML(state *PluginState) string {
           progressHtml +
           tilesHtml +
           creditListHtml +
+          (blocked ? '<p role="status">' + escapeHTML(blocked) + '</p>' : '') +
           statusPanel +
           renderCardHistory(historyByAcct[id]) +
           '<div class="card-actions">' +
           '<button class="check-btn primary" data-auth="' + escapeHTML(id) + '">' + escapeHTML(t('check')) + '</button>' +
-          '<button class="secondary reset-btn" data-auth="' + escapeHTML(id) + '">' + escapeHTML(t('reset')) + '</button>' +
+          '<button class="secondary reset-btn" data-auth="' + escapeHTML(id) + '"' + ((status.config || {}).observe_only ? ' disabled' : '') + '>' + escapeHTML(t('reset')) + '</button>' +
           '</div>' +
           '</div>';
       }).join('');
@@ -1258,9 +1296,9 @@ func renderStatusHTML(state *PluginState) string {
     async function loadStatus() {
       try {
         const results = await Promise.all([
-          apiGet('/v0/management/plugins/codex-auto-reset/status'),
-          apiGet('/v0/management/plugins/codex-auto-reset/logs'),
-          apiGet('/v0/management/plugins/codex-auto-reset/accounts').catch(function () { return { accounts: [] }; }),
+          apiGet('/v0/management/plugins/reset-manager/status'),
+          apiGet('/v0/management/plugins/reset-manager/logs'),
+          apiGet('/v0/management/plugins/reset-manager/accounts').catch(function () { return { accounts: [] }; }),
         ]);
         const status = results[0], logsResp = results[1], acctsResp = results[2];
         // Build the name cache from /accounts.
@@ -1272,6 +1310,7 @@ func renderStatusHTML(state *PluginState) string {
         renderStats(status.reset_history || []);
         renderLogs(logsResp.entries || []);
         const c = status.config || {};
+        document.getElementById('observeOnly').checked = c.observe_only !== false;
         document.getElementById('refreshInterval').value = (c.refresh_interval || '').toString();
         document.getElementById('triggerLeadTime').value = (c.trigger_lead_time || '').toString();
         currentAccounts = acctsResp.accounts || [];
@@ -1311,7 +1350,8 @@ func renderStatusHTML(state *PluginState) string {
     }
     async function saveSettings() {
       try {
-        await apiSend('PUT', '/v0/management/plugins/codex-auto-reset/settings', {
+        await apiSend('PUT', '/v0/management/plugins/reset-manager/settings', {
+          observe_only: document.getElementById('observeOnly').checked,
           refresh_interval: document.getElementById('refreshInterval').value.trim(),
           trigger_lead_time: document.getElementById('triggerLeadTime').value.trim(),
           enabled_accounts: getEnabledAccounts()
@@ -1320,13 +1360,13 @@ func renderStatusHTML(state *PluginState) string {
       } catch (e) { alert(e.message); }
     }
     async function checkOne(id) {
-      try { await apiSend('POST', '/v0/management/plugins/codex-auto-reset/check', { auth_index: id }); await loadStatus(); }
+      try { await apiSend('POST', '/v0/management/plugins/reset-manager/check', { auth_index: id }); await loadStatus(); }
       catch (e) { alert(e.message); }
     }
     async function resetOne(id) {
       if (!confirm(t('confirmReset'))) return;
       try {
-        await apiSend('POST', '/v0/management/plugins/codex-auto-reset/reset', { auth_index: id });
+        await apiSend('POST', '/v0/management/plugins/reset-manager/reset', { auth_index: id });
         // The worker steps the FSM asynchronously (CONFIRMING→RESETTING→VERIFYING
         // within ~seconds). Refresh once immediately, then again after a short
         // delay so the state transitions become visible without manual clicks.
@@ -1353,7 +1393,7 @@ func renderStatusHTML(state *PluginState) string {
     // Remember-management-key helpers (pattern from codex-quota-scheduler).
     // The key is stored unencrypted in this browser's localStorage only —
     // never sent anywhere except as the Authorization header to CPA.
-    const MANAGEMENT_KEY_STORAGE = 'codex-auto-reset-management-key-v1';
+    const MANAGEMENT_KEY_STORAGE = 'reset-manager-management-key-v1';
     function syncRememberedKey() {
       const remember = document.getElementById('rememberManagementKey').checked;
       const key = document.getElementById('managementKey').value.trim();
@@ -1372,14 +1412,14 @@ func renderStatusHTML(state *PluginState) string {
     }
 
     function onLoad() {
-      const savedLocale = localStorage.getItem('codex-auto-reset-locale');
+      const savedLocale = localStorage.getItem('reset-manager-locale');
       if (savedLocale === 'zh' || savedLocale === 'en') {
         document.getElementById('locale').value = savedLocale;
       } else {
         document.getElementById('locale').value = (navigator.language || '').toLowerCase().indexOf('zh') === 0 ? 'zh' : 'en';
       }
       document.getElementById('locale').addEventListener('change', function () {
-        localStorage.setItem('codex-auto-reset-locale', document.getElementById('locale').value);
+        localStorage.setItem('reset-manager-locale', document.getElementById('locale').value);
         applyI18n();
       });
       // Locale switch buttons drive the hidden <select> so all listeners stay wired.
@@ -1387,7 +1427,7 @@ func renderStatusHTML(state *PluginState) string {
         const target = ev.target;
         if (!(target instanceof Element) || target.tagName !== 'BUTTON') return;
         document.getElementById('locale').value = target.dataset.locale || 'en';
-        localStorage.setItem('codex-auto-reset-locale', document.getElementById('locale').value);
+        localStorage.setItem('reset-manager-locale', document.getElementById('locale').value);
         applyI18n();
       });
       document.getElementById('refresh').addEventListener('click', loadStatus);
@@ -1431,4 +1471,10 @@ func renderStatusHTML(state *PluginState) string {
   </script>
 </body>
 </html>`
+}
+
+func (h *managementHandlers) saveState() error {
+	pluginStateMu.Lock()
+	defer pluginStateMu.Unlock()
+	return saveState(h.statePath, h.state)
 }

@@ -50,6 +50,6 @@ func classifyConsume(resp ConsumeResponse, err error) retryDecision {
 	case ConsumeCodeNoCredit, ConsumeCodeNothingToReset:
 		return decisionStop
 	default:
-		return decisionStop
+		return decisionRetry // Unknown success bodies may follow a committed redemption.
 	}
 }

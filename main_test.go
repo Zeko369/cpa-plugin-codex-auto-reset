@@ -12,7 +12,7 @@ import (
 
 func TestPluginRegistration(t *testing.T) {
 	reg := pluginRegistration()
-	if reg.Metadata.Name != "Codex Auto Reset" {
+	if reg.Metadata.Name != "Account Reset Manager" {
 		t.Fatalf("name = %q", reg.Metadata.Name)
 	}
 	if reg.Capabilities.ManagementAPI != true {
@@ -138,7 +138,7 @@ func TestResolveStatePath_Precedence(t *testing.T) {
 		{AuthIndex: "runtime-only"}, // no Path — skipped
 		{AuthIndex: "codex-1", Path: filepath.Join(authDir, "codex-1.json")},
 	}
-	derived := filepath.Join(authDir, "plugin-state", "codex-auto-reset", "state.json")
+	derived := filepath.Join(authDir, "plugin-state", "reset-manager", "state.json")
 	cases := []struct {
 		name     string
 		stateDir string
@@ -171,7 +171,7 @@ func TestResolveStatePath_PlacesStateUnderAuthDir(t *testing.T) {
 		{AuthIndex: "a", Path: filepath.Join(authDir, "codex-team.json")},
 	}
 	got := resolveStatePath("", entries)
-	want := filepath.Join(authDir, "plugin-state", "codex-auto-reset", "state.json")
+	want := filepath.Join(authDir, "plugin-state", "reset-manager", "state.json")
 	if got != want {
 		t.Fatalf("state not under auth dir: got %q want %q", got, want)
 	}

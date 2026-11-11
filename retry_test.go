@@ -33,8 +33,8 @@ func TestClassifyConsume_SuccessCodes(t *testing.T) {
 		{"already_redeemed", ConsumeResponse{Code: ConsumeCodeAlreadyRedeemed}, decisionSuccess},
 		{"no_credit", ConsumeResponse{Code: ConsumeCodeNoCredit}, decisionStop},
 		{"nothing_to_reset", ConsumeResponse{Code: ConsumeCodeNothingToReset}, decisionStop},
-		{"unknown_code", ConsumeResponse{Code: "garbage"}, decisionStop},
-		{"empty_code", ConsumeResponse{}, decisionStop},
+		{"unknown_code", ConsumeResponse{Code: "garbage"}, decisionRetry},
+		{"empty_code", ConsumeResponse{}, decisionRetry},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -65,7 +65,7 @@ func TestClassifyConsume_ErrorClassification(t *testing.T) {
 		{"5xx_server_error", &HTTPStatusError{Code: 502}, decisionRetry},
 		{"5xx_gateway_timeout", &HTTPStatusError{Code: 504}, decisionRetry},
 		{"plain_network_error", netErr{}, decisionRetry},
-		{"wrapped_network_error", errors.New("wrapped: "+(netErr{}).Error()), decisionRetry},
+		{"wrapped_network_error", errors.New("wrapped: " + (netErr{}).Error()), decisionRetry},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
