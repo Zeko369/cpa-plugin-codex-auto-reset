@@ -51,7 +51,7 @@ func (m *testMgmtHelper) post(t *testing.T, path string, b []byte) []byte {
 
 func TestManagement_StatusRoute(t *testing.T) {
 	srv := newTestManagement(t, Config{RefreshInterval: 12 * time.Hour, TriggerLeadTime: 6 * time.Hour, EnabledAccounts: []string{"a"}}, []string{"a"})
-	body := srv.get(t, "/v0/management/plugins/codex-auto-reset/status")
+	body := srv.get(t, "/v0/management/plugins/reset-manager/status")
 	var resp struct {
 		Plugin   string                    `json:"plugin"`
 		Config   Config                    `json:"config"`
@@ -60,7 +60,7 @@ func TestManagement_StatusRoute(t *testing.T) {
 	if err := json.Unmarshal(body, &resp); err != nil {
 		t.Fatalf("unmarshal: %v (body=%s)", err, body)
 	}
-	if resp.Plugin != "codex-auto-reset" {
+	if resp.Plugin != "reset-manager" {
 		t.Fatalf("plugin = %q", resp.Plugin)
 	}
 	if resp.Config.RefreshInterval != 12*time.Hour {
@@ -73,7 +73,7 @@ func TestManagement_StatusRoute(t *testing.T) {
 
 func TestManagement_PutSettingsUpdatesAndPersists(t *testing.T) {
 	srv := newTestManagement(t, DefaultConfig(), nil)
-	body := srv.put(t, "/v0/management/plugins/codex-auto-reset/settings", []byte(`{"refresh_interval":"4h","trigger_lead_time":"2h","enabled_accounts":["x"]}`))
+	body := srv.put(t, "/v0/management/plugins/reset-manager/settings", []byte(`{"refresh_interval":"4h","trigger_lead_time":"2h","enabled_accounts":["x"]}`))
 	var resp struct {
 		RefreshInterval string   `json:"refresh_interval"`
 		TriggerLeadTime string   `json:"trigger_lead_time"`
@@ -100,7 +100,7 @@ func TestManagement_PutSettingsUpdatesAndPersists(t *testing.T) {
 
 func TestManagement_UnknownRouteReturns404(t *testing.T) {
 	srv := newTestManagement(t, DefaultConfig(), nil)
-	status, _, _ := srv.h.handle(http.MethodGet, "/codex-auto-reset/nonexistent", nil, nil)
+	status, _, _ := srv.h.handle(http.MethodGet, "/reset-manager/nonexistent", nil, nil)
 	if status != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", status)
 	}
@@ -108,9 +108,9 @@ func TestManagement_UnknownRouteReturns404(t *testing.T) {
 
 func TestManagement_ImportExportRoundTrip(t *testing.T) {
 	srv := newTestManagement(t, DefaultConfig(), nil)
-	exported := srv.get(t, "/v0/management/plugins/codex-auto-reset/export")
+	exported := srv.get(t, "/v0/management/plugins/reset-manager/export")
 	// Re-import the exported state.
-	srv.post(t, "/v0/management/plugins/codex-auto-reset/import", exported)
+	srv.post(t, "/v0/management/plugins/reset-manager/import", exported)
 	// State should be unchanged (round-trip).
 	loaded, _, _ := loadState(srv.h.statePath)
 	if loaded.Config.RefreshInterval != DefaultConfig().RefreshInterval {
@@ -120,9 +120,28 @@ func TestManagement_ImportExportRoundTrip(t *testing.T) {
 
 func TestManagement_ImportRejectsBadJSON(t *testing.T) {
 	srv := newTestManagement(t, DefaultConfig(), nil)
-	status, _, _ := srv.h.handle(http.MethodPost, "/codex-auto-reset/import", nil, []byte(`{bad json`))
+	status, _, _ := srv.h.handle(http.MethodPost, "/reset-manager/import", nil, []byte(`{bad json`))
 	if status != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", status)
+	}
+}
+
+func TestManagement_ImportCannotReplaceLiveIntent(t *testing.T) {
+	srv := newTestManagement(t, DefaultConfig(), []string{"a"})
+	exported := srv.get(t, "/reset-manager/export")
+	r := srv.h.state.Accounts["a"]
+	r.State = StateRESETTING
+	r.Attempt.Pending = true
+	r.Attempt.RedeemRequestID = "existing-intent"
+	srv.h.state.Accounts["a"] = r
+	status, _, _ := srv.h.handle(http.MethodPost, "/reset-manager/import", nil, exported)
+	if status != http.StatusConflict || srv.h.state.Accounts["a"].Attempt.RedeemRequestID != "existing-intent" {
+		t.Fatalf("import replaced an unresolved attempt: status %d", status)
+	}
+	srv.h.state.Config.ObserveOnly = false
+	status, _, _ = srv.h.handle(http.MethodPost, "/reset-manager/import", nil, exported)
+	if status != http.StatusConflict {
+		t.Fatalf("live import status %d, want 409", status)
 	}
 }
 
@@ -131,13 +150,13 @@ func TestStatusHTML_DerivesAPIRootFromPageURL(t *testing.T) {
 	// below /cpa, so the UI must not hardcode root-absolute /v0/management
 	// URLs. Mirror of quota-scheduler issue #17.
 	h := newManagementHandlers(&PluginState{Config: DefaultConfig(), Accounts: map[string]AccountRuntime{}}, "", nil)
-	_, body, _ := h.handle(http.MethodGet, "/v0/resource/plugins/codex-auto-reset/status", nil, nil)
+	_, body, _ := h.handle(http.MethodGet, "/v0/resource/plugins/reset-manager/status", nil, nil)
 	html := string(body)
 	for _, want := range []string{
 		"function apiRootPrefix()",
 		"const ROOT_PREFIX = apiRootPrefix()",
 		"fetch(ROOT_PREFIX + path",
-		"'/v0/resource/plugins/codex-auto-reset/status'",
+		"'/v0/resource/plugins/reset-manager/status'",
 	} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("HTML missing API-root derivation %q", want)
@@ -165,24 +184,24 @@ func TestResourcePath_RejectsStateChangingRequests(t *testing.T) {
 		{http.MethodGet, "/logs", nil},
 	}
 	for _, tc := range cases {
-		status, _, _ := srv.h.handle(tc.method, "/v0/resource/plugins/codex-auto-reset"+tc.suffix, nil, tc.body)
+		status, _, _ := srv.h.handle(tc.method, "/v0/resource/plugins/reset-manager"+tc.suffix, nil, tc.body)
 		if status != http.StatusNotFound {
 			t.Fatalf("%s %s on resource path: status %d, want 404", tc.method, tc.suffix, status)
 		}
 	}
 	// The read-only page itself stays available.
-	status, _, contentType := srv.h.handle(http.MethodGet, "/v0/resource/plugins/codex-auto-reset/status", nil, nil)
+	status, _, contentType := srv.h.handle(http.MethodGet, "/v0/resource/plugins/reset-manager/status", nil, nil)
 	if status != http.StatusOK || !strings.HasPrefix(contentType, "text/html") {
 		t.Fatalf("resource status: status=%d contentType=%q", status, contentType)
 	}
 }
 
 func TestStatusHTML_ResourcePathReturnsHTML(t *testing.T) {
-	// The browser resource path (/v0/resource/plugins/codex-auto-reset/status)
+	// The browser resource path (/v0/resource/plugins/reset-manager/status)
 	// must return the HTML page, NOT JSON. Regression guard for the bug where
 	// management.html loaded the resource URL and got raw JSON instead of the UI.
 	h := newManagementHandlers(&PluginState{Config: DefaultConfig(), Accounts: map[string]AccountRuntime{}}, "", nil)
-	status, body, contentType := h.handle(http.MethodGet, "/v0/resource/plugins/codex-auto-reset/status", nil, nil)
+	status, body, contentType := h.handle(http.MethodGet, "/v0/resource/plugins/reset-manager/status", nil, nil)
 	if status != http.StatusOK {
 		t.Fatalf("status = %d", status)
 	}
@@ -190,7 +209,7 @@ func TestStatusHTML_ResourcePathReturnsHTML(t *testing.T) {
 		t.Fatalf("resource /status must return HTML, got Content-Type %q (body starts: %s)", contentType, truncate(body, 80))
 	}
 	html := string(body)
-	for _, want := range []string{"codex-auto-reset", "data-i18n", "EN", "ZH", "fetch(", "authorization"} {
+	for _, want := range []string{"reset-manager", "data-i18n", "EN", "ZH", "fetch(", "authorization"} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("HTML missing %q", want)
 		}
@@ -198,10 +217,10 @@ func TestStatusHTML_ResourcePathReturnsHTML(t *testing.T) {
 }
 
 func TestStatus_ManagementPathReturnsJSON(t *testing.T) {
-	// The management path (/v0/management/plugins/codex-auto-reset/status)
+	// The management path (/v0/management/plugins/reset-manager/status)
 	// must return JSON for the JS frontend, NOT the HTML page.
 	srv := newTestManagement(t, Config{RefreshInterval: 12 * time.Hour, TriggerLeadTime: 6 * time.Hour, EnabledAccounts: []string{"a"}}, []string{"a"})
-	status, body, contentType := srv.h.handle(http.MethodGet, "/v0/management/plugins/codex-auto-reset/status", nil, nil)
+	status, body, contentType := srv.h.handle(http.MethodGet, "/v0/management/plugins/reset-manager/status", nil, nil)
 	if status != http.StatusOK {
 		t.Fatalf("status = %d", status)
 	}
@@ -233,7 +252,7 @@ func TestAccountsRoute_ReturnsListWithEnabledFlag(t *testing.T) {
 			{AuthIndex: "idx-b", ID: "codex-222-bob@example.com-team.json", Name: "codex-222-bob@example.com-team.json", Email: "bob@example.com"},
 		}, nil
 	}
-	status, body, _ := srv.h.handle(http.MethodGet, "/v0/management/plugins/codex-auto-reset/accounts", nil, nil)
+	status, body, _ := srv.h.handle(http.MethodGet, "/v0/management/plugins/reset-manager/accounts", nil, nil)
 	if status != http.StatusOK {
 		t.Fatalf("status = %d body %s", status, body)
 	}
@@ -264,7 +283,7 @@ func TestAccountsRoute_NoListerReturns503(t *testing.T) {
 	// route should return 503, not 500 or crash.
 	srv := newTestManagement(t, DefaultConfig(), nil)
 	srv.h.lister = nil
-	status, _, _ := srv.h.handle(http.MethodGet, "/v0/management/plugins/codex-auto-reset/accounts", nil, nil)
+	status, _, _ := srv.h.handle(http.MethodGet, "/v0/management/plugins/reset-manager/accounts", nil, nil)
 	if status != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", status)
 	}
@@ -284,7 +303,7 @@ func TestAccountsRoute_WildcardMarksAllEnabled(t *testing.T) {
 			{AuthIndex: "idx-b", Name: "b.json"},
 		}, nil
 	}
-	body := srv.get(t, "/v0/management/plugins/codex-auto-reset/accounts")
+	body := srv.get(t, "/v0/management/plugins/reset-manager/accounts")
 	var resp struct {
 		Accounts []AccountOption `json:"accounts"`
 	}
@@ -305,7 +324,7 @@ func TestAccountsRoute_WildcardMarksAllEnabled(t *testing.T) {
 // saves ["*"]; a mix of wildcard + explicit entries collapses to ["*"].
 func TestPutSettings_AcceptsWildcardAndPersists(t *testing.T) {
 	srv := newTestManagement(t, DefaultConfig(), nil)
-	body := srv.put(t, "/v0/management/plugins/codex-auto-reset/settings",
+	body := srv.put(t, "/v0/management/plugins/reset-manager/settings",
 		[]byte(`{"refresh_interval":"12h","trigger_lead_time":"6h","enabled_accounts":["*","idx-a"]}`))
 	var resp struct {
 		EnabledAccounts []string `json:"enabled_accounts"`
@@ -330,7 +349,7 @@ func TestPutSettings_AcceptsWildcardAndPersists(t *testing.T) {
 // back to the wildcard default.
 func TestPutSettings_EmptyListStillOptsOut(t *testing.T) {
 	srv := newTestManagement(t, DefaultConfig(), nil)
-	body := srv.put(t, "/v0/management/plugins/codex-auto-reset/settings",
+	body := srv.put(t, "/v0/management/plugins/reset-manager/settings",
 		[]byte(`{"refresh_interval":"12h","trigger_lead_time":"6h","enabled_accounts":[]}`))
 	var resp struct {
 		EnabledAccounts []string `json:"enabled_accounts"`

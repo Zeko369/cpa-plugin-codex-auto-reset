@@ -10,6 +10,9 @@ import (
 )
 
 type CodexCredentials struct {
+	Provider         string
+	Identity         string
+	OrganizationID   string
 	AccessToken      string
 	RefreshToken     string
 	IDToken          string
@@ -44,6 +47,8 @@ func ExtractCodexCredentials(raw json.RawMessage) (CodexCredentials, error) {
 	}
 
 	return CodexCredentials{
+		Provider:         "codex",
+		Identity:         "codex:" + accountID,
 		AccessToken:      accessToken,
 		RefreshToken:     refreshToken,
 		IDToken:          idToken,

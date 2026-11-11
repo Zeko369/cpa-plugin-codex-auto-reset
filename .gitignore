@@ -14,6 +14,7 @@ coverage.out
 
 # Local plugin state
 codex-auto-reset.state.json
+reset-manager.state.json
 *.annotations.json
 
 # Editor and OS files

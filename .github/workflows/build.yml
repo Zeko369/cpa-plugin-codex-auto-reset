@@ -13,7 +13,7 @@ permissions:
   contents: write
 
 env:
-  PLUGIN_NAME: codex-auto-reset
+  PLUGIN_NAME: reset-manager
 
 jobs:
   test:

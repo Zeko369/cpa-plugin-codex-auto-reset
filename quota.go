@@ -69,10 +69,12 @@ func parseResetCreditsResponse(raw []byte, now time.Time) (Snapshot, error) {
 
 // parseUsageResponse parses GET /wham/usage using flexible map lookups.
 // The real wire shape (confirmed from live data) is:
-//   "rate_limit": {
-//     "primary_window": {"limit_window_seconds": 604800, "used_percent": 9},
-//     "secondary_window": null
-//   }
+//
+//	"rate_limit": {
+//	  "primary_window": {"limit_window_seconds": 604800, "used_percent": 9},
+//	  "secondary_window": null
+//	}
+//
 // primary_window can be the WEEKLY window (604800s) when there's no
 // secondary. We identify the weekly window by limit_window_seconds ≈ 604800,
 // NOT by position (primary/secondary). code_review_rate_limit may also be
@@ -121,7 +123,7 @@ func parseUsageResponse(raw []byte, now time.Time) (Snapshot, error) {
 		}
 	}
 
-	weeklyPct := 100
+	weeklyPct := -1
 	if weeklyUsed >= 0 {
 		weeklyPct = 100 - int(weeklyUsed+0.5)
 		if weeklyPct < 0 {

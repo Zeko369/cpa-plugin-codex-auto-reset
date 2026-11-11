@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
+
+var stateWriteMu sync.Mutex
 
 // PluginState is the on-disk persistent shape. The plugin writes this to
 // <state-dir>/state.json after every meaningful change so a restart resumes
@@ -23,29 +26,57 @@ type PluginState struct {
 // AccountRuntime is the persisted per-account FSM snapshot. Only the fields
 // needed to resume scheduling are stored; transient step state is not.
 type AccountRuntime struct {
-	AuthID       string       `json:"auth_id"`
-	State        State        `json:"state"`
-	NextWake     time.Time    `json:"next_wake"`
-	Attempt      ResetAttempt `json:"attempt,omitempty"`
-	LastSnapshot Snapshot     `json:"last_snapshot,omitempty"`
+	AuthID            string       `json:"auth_id"`
+	State             State        `json:"state"`
+	NextWake          time.Time    `json:"next_wake"`
+	Attempt           ResetAttempt `json:"attempt,omitempty"`
+	LastSnapshot      Snapshot     `json:"last_snapshot,omitempty"`
+	Identity          string       `json:"identity,omitempty"`
+	Provider          string       `json:"provider,omitempty"`
+	ScheduledCreditID string       `json:"scheduled_credit_id,omitempty"`
+	ManualReset       bool         `json:"manual_reset,omitempty"`
+	VerifyDue         time.Time    `json:"verify_due,omitempty"`
 }
 
 // saveState writes state atomically: marshal → write to <path>.tmp → rename.
 // The tmp+rename pattern ensures a crash mid-write leaves the prior file
 // intact rather than a truncated one.
 func saveState(path string, s *PluginState) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	stateWriteMu.Lock()
+	defer stateWriteMu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	raw, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), ".reset-state-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if _, err := f.Write(raw); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	d, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // stateReadRetries/readRetryDelay tolerate transient read locks (Windows AV

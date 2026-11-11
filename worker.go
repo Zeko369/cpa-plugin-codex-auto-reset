@@ -46,6 +46,10 @@ type Worker struct {
 	// PluginState for the management UI and crash recovery. Called inline
 	// from the worker goroutine.
 	StateSync func(authID string, fsm *AccountFSM)
+	Restore   func(string) (AccountRuntime, bool)
+	Persist   func(AccountRuntime) error
+	done      chan struct{}
+	running   bool
 
 	mu      sync.Mutex
 	fsms    map[string]*AccountFSM
@@ -87,7 +91,7 @@ func NewWorker(cfg Config, enabled []string, loader CredsLoader, nowFn func() ti
 		cfg: cfg, enabled: enabled, resolvedEnabled: static, loader: loader, nowFn: nowFn,
 		fsms: map[string]*AccountFSM{}, missingRetryAt: map[string]time.Time{},
 		logs:   newLogRing(maxLogEntries),
-		stopCh: make(chan struct{}), wakeCh: make(chan struct{}, 1),
+		stopCh: make(chan struct{}), wakeCh: make(chan struct{}, 1), done: make(chan struct{}),
 	}
 }
 
@@ -205,6 +209,10 @@ func (w *Worker) ForceConfirm(authID string) error {
 // accounts forever. The panicking account gets its nextWake pushed forward
 // and the loop continues.
 func (w *Worker) Run() {
+	w.mu.Lock()
+	w.running = true
+	w.mu.Unlock()
+	defer close(w.done)
 	defer func() {
 		if r := recover(); r != nil {
 			// This should never happen — the inner recover should catch per-account
@@ -305,6 +313,12 @@ func (w *Worker) stepAccountSafe(authID string) {
 		return
 	}
 
+	if fsm.Creds.Identity != "" && fsm.Creds.Identity != creds.Identity {
+		fsm.mu.Lock()
+		fsm.hold("credential identity changed; automation paused")
+		fsm.mu.Unlock()
+		return
+	}
 	// Set credentials and client under the FSM mutex to avoid data races
 	// with concurrent State()/NextWake() readers.
 	fsm.mu.Lock()
@@ -344,10 +358,25 @@ func (w *Worker) ensureFSM(id string) {
 		})
 		return
 	}
+	w.mu.Lock()
+	for _, existing := range w.fsms {
+		if creds.Identity != "" && existing.Creds.Identity == creds.Identity {
+			w.mu.Unlock()
+			w.logs.append(LogEntry{Timestamp: w.nowFn(), Level: "warn", Scope: id, Message: "duplicate provider account ignored"})
+			return
+		}
+	}
+	w.mu.Unlock()
 	fsm := NewAccountFSM(id, creds, w.cfg, client, w.nowFn, w.makeLogFn(id))
 	// Seed nextWake=now so the very first loop tick steps this FSM. Without
 	// this, a fresh FSM has zero nextWake and soonest() skips it forever.
 	fsm.SetNextWake(w.nowFn())
+	fsm.Persist = w.Persist
+	if w.Restore != nil {
+		if r, ok := w.Restore(id); ok {
+			fsm.Restore(r)
+		}
+	}
 	w.mu.Lock()
 	if _, ok := w.fsms[id]; !ok {
 		w.fsms[id] = fsm
