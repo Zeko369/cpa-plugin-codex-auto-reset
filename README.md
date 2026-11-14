@@ -35,7 +35,8 @@ Requires Go 1.26+, CGO, and a C compiler:
 go test -race ./...
 go vet ./...
 (cd sim && go test ./...)
-make build VERSION=0.2.0
+node --test tests/session-auth.test.mjs
+make build VERSION=0.2.1
 ```
 
 Copy `dist/reset-manager.so` to the platform plugin directory, for example
@@ -98,3 +99,20 @@ observation mode, and account changes. Live rollout checks read balances only;
 no real credit is redeemed as a test.
 
 MIT license; original attribution is preserved in LICENSE and repository history.
+
+## Management session authentication
+
+With the companion management UI fork, opening this plugin from the sidebar uses
+that authenticated management session. The shell sends the credential only to its
+registered, backend-hosted iframe, with explicit origin and source checks. The
+plugin retains it in memory for normal authenticated API calls, clears it on host
+logout, and does not place it in URLs, form fields, or plugin local storage.
+Previously remembered plugin keys are removed once the host session takes over.
+
+Direct resource bookmarks redirect to
+`management.html#/plugin-pages/reset-manager/0`, so management login and its
+remember-password setting own authentication. For another host without the session
+bridge, explicit `?standalone=1` retains the manual-key interface. No server-side
+authentication checks or reset policies are changed.
+
+UI session regressions run with `node --test tests/session-auth.test.mjs`.

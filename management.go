@@ -438,8 +438,8 @@ func jsonStatus(status int, v any) (int, []byte) {
 
 // renderStatusHTML returns the bilingual resource page. The page is static
 // HTML with inline CSS and JS; it fetches the reset-manager status and logs
-// at runtime using a user-supplied CPA Management
-// key. No secrets are embedded in the HTML.
+// at runtime using the management shell session or an explicit standalone key.
+// No secrets are embedded in the HTML.
 func renderStatusHTML(state *PluginState) string {
 	_ = state
 	return `<!doctype html>
@@ -741,9 +741,10 @@ func renderStatusHTML(state *PluginState) string {
     </header>
     <div class="layout">
       <aside class="sidebar">
-        <section class="panel">
+        <section class="panel" id="connectionPanel">
           <h2><span class="dot"></span><span data-i18n="connection">Connection</span></h2>
-          <div class="field-stack">
+          <p id="hostSessionStatus" hidden data-i18n="hostSession">Connected through the management session</p>
+          <div class="field-stack" id="manualConnection">
             <label class="field"><span data-i18n="managementKey">CPA management key</span>
               <input id="managementKey" type="password" autocomplete="off" spellcheck="false">
             </label>
@@ -804,6 +805,7 @@ func renderStatusHTML(state *PluginState) string {
         title: "Account Reset Manager",
         connection: "Connection",
         settings: "Settings",
+        hostSession: "Connected through the management session",
         managementKey: "CPA management key",
         rememberKey: "Remember management key in this browser",
         rememberKeyHelp: "The key is stored unencrypted in browser local storage. Enable only on a trusted device.",
@@ -846,6 +848,7 @@ func renderStatusHTML(state *PluginState) string {
         title: "Codex \u81ea\u52a8\u91cd\u7f6e",
         connection: "\u8fde\u63a5",
         settings: "\u8bbe\u7f6e",
+        hostSession: "\u5df2\u901a\u8fc7\u7ba1\u7406\u4f1a\u8bdd\u8fde\u63a5",
         managementKey: "CPA \u7ba1\u7406\u5bc6\u94a5",
         rememberKey: "\u5728\u6b64\u6d4f\u89c8\u5668\u4e2d\u8bb0\u4f4f\u7ba1\u7406\u5bc6\u94a5",
         rememberKeyHelp: "\u5bc6\u94a5\u5c06\u4ee5\u672a\u52a0\u5bc6\u5f62\u5f0f\u4fdd\u5b58\u5728\u6d4f\u89c8\u5668\u672c\u5730\u5b58\u50a8\u4e2d\u3002\u8bf7\u4ec5\u5728\u53d7\u4fe1\u4efb\u7684\u8bbe\u5907\u4e0a\u542f\u7528\u3002",
@@ -899,8 +902,12 @@ func renderStatusHTML(state *PluginState) string {
         else { btn.classList.remove('active'); }
       }
     }
+    var hostManagementKey = null;
+    function currentManagementKey() {
+      return hostManagementKey === null ? document.getElementById('managementKey').value.trim() : hostManagementKey;
+    }
     function authHeaders() {
-      const key = document.getElementById('managementKey').value.trim();
+      const key = currentManagementKey();
       if (!key) throw new Error(t('keyRequired'));
       const auth = key.toLowerCase().startsWith('bearer ') ? key : 'Bearer ' + key;
       // HTTP header names are case-insensitive; fetch() normalizes the key.
@@ -925,6 +932,44 @@ func renderStatusHTML(state *PluginState) string {
       return index > 0 ? path.slice(0, index) : '';
     }
     const ROOT_PREFIX = apiRootPrefix();
+    // The management shell owns authentication. Plugin API calls still use the
+    // normal bearer checks; the key stays in memory and is never placed in URLs.
+    function initializeHostSession() {
+      const params = new URLSearchParams(location.search);
+      if (window.parent === window) {
+        if (params.get('standalone') !== '1') {
+          location.replace(ROOT_PREFIX + '/management.html#/plugin-pages/reset-manager/0');
+          return true;
+        }
+        return false;
+      }
+      let parentOrigin;
+      try {
+        const url = new URL(params.get('parent_origin') || location.origin);
+        if (url.protocol !== 'https:' && url.protocol !== 'http:') return false;
+        parentOrigin = url.origin;
+      } catch (_) { return false; }
+      window.addEventListener('message', function (event) {
+        const data = event.data;
+        if (event.source !== window.parent || event.origin !== parentOrigin ||
+            !data || data.type !== 'cliproxy-plugin-session' || data.pluginId !== 'reset-manager' ||
+            typeof data.managementKey !== 'string' || typeof data.apiBase !== 'string') return;
+        if (data.apiBase.replace(/\/+$/, '') !== location.origin + ROOT_PREFIX) return;
+        const key = data.managementKey.trim();
+        hostManagementKey = key;
+        document.getElementById('managementKey').value = '';
+        document.getElementById('rememberManagementKey').checked = false;
+        try { localStorage.removeItem(MANAGEMENT_KEY_STORAGE); } catch (_) {}
+        document.getElementById('manualConnection').hidden = true;
+        document.getElementById('manualConnection').style.display = 'none';
+        document.getElementById('hostSessionStatus').hidden = !key;
+        document.querySelector('.layout').style.display = key ? '' : 'none';
+        if (key) loadStatus();
+      });
+      window.parent.postMessage({type: 'cliproxy-plugin-session-request', pluginId: 'reset-manager'}, parentOrigin);
+      return false;
+    }
+
     async function apiGet(path) {
       const r = await fetch(ROOT_PREFIX + path, { headers: authHeaders() });
       if (!r.ok) throw new Error(path + ': ' + r.status);
@@ -1385,7 +1430,7 @@ func renderStatusHTML(state *PluginState) string {
       if (autoRefreshTimer) return;
       autoRefreshTimer = setInterval(function () {
         if (document.hidden) return;
-        const key = document.getElementById('managementKey').value.trim();
+        const key = currentManagementKey();
         if (!key) return;
         loadStatus().catch(function () {});
       }, 15000);
@@ -1446,7 +1491,9 @@ func renderStatusHTML(state *PluginState) string {
       document.getElementById('managementKey').addEventListener('keydown', function (ev) {
         if (ev.key === 'Enter') { syncRememberedKey(); loadStatus(); }
       });
-      restoreRememberedKey();
+      if (window.parent === window) restoreRememberedKey();
+      if (initializeHostSession()) return;
+      if (document.getElementById('managementKey').value.trim()) loadStatus();
       document.addEventListener('click', function (ev) {
         const target = ev.target;
         if (!(target instanceof Element)) return;

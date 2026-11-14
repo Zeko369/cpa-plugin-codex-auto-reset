@@ -78,7 +78,7 @@ var (
 	// dir). All saves go through it so reconfigure cannot split state
 	// across locations.
 	globalStatePath string
-	pluginVersion   = "0.2.0"
+	pluginVersion   = "0.2.1"
 )
 
 func main() {}
