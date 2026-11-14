@@ -110,7 +110,7 @@ logout, and does not place it in URLs, form fields, or plugin local storage.
 Previously remembered plugin keys are removed once the host session takes over.
 
 Direct resource bookmarks redirect to
-`management.html#/plugin-pages/reset-manager/0`, so management login and its
+`management.html?plugin=reset-manager#/plugin-pages/reset-manager/0`, so management login and its
 remember-password setting own authentication. For another host without the session
 bridge, explicit `?standalone=1` retains the manual-key interface. No server-side
 authentication checks or reset policies are changed.

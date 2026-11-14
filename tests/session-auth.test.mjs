@@ -78,7 +78,7 @@ test('host logout clears the in-memory credential and hides the account view', (
 test('direct bookmarks use management login; explicit standalone mode remains available', () => {
   const page = browser({ embedded: false, search: '' });
   assert.equal(vm.runInContext('initializeHostSession()', page.context), true);
-  assert.deepEqual(page.redirects, ['/gateway/management.html#/plugin-pages/reset-manager/0']);
+  assert.deepEqual(page.redirects, ['/gateway/management.html?plugin=reset-manager#/plugin-pages/reset-manager/0']);
   const standalone = browser({ embedded: false, search: '?standalone=1' });
   assert.equal(vm.runInContext('initializeHostSession()', standalone.context), false);
   assert.equal(standalone.redirects.length, 0);

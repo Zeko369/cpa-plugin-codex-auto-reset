@@ -938,7 +938,8 @@ func renderStatusHTML(state *PluginState) string {
       const params = new URLSearchParams(location.search);
       if (window.parent === window) {
         if (params.get('standalone') !== '1') {
-          location.replace(ROOT_PREFIX + '/management.html#/plugin-pages/reset-manager/0');
+          // A distinct entry URL avoids a cached pre-bridge management bundle.
+          location.replace(ROOT_PREFIX + '/management.html?plugin=reset-manager#/plugin-pages/reset-manager/0');
           return true;
         }
         return false;
